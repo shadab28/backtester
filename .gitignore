@@ -23,10 +23,10 @@ build/
 stock_data/
 stock_data copy/
 
-# Trade logs (generated output)
-trade_logs/
-trade_logs_new_strategy/
-trade_logs_only_long/
+# # Trade logs (generated output)
+# trade_logs/
+# trade_logs_new_strategy/
+# trade_logs_only_long/
 
 # Virtual environment
 venv/
