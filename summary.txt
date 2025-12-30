@@ -1,0 +1,58 @@
+================================================================================
+                    BACKTEST PERFORMANCE SUMMARY
+================================================================================
+
+Date Range: 2025-08-01 to 2025-08-28
+Trading Days: 17
+Initial Capital: ₹10,00,000
+
+================================================================================
+                         PERFORMANCE METRICS
+================================================================================
+
+┌────────────────────┬─────────────────┬─────────────────┐
+│      Metric        │   LONG Only     │  Full Strategy  │
+│                    │                 │  (LONG + SHORT) │
+├────────────────────┼─────────────────┼─────────────────┤
+│ Total Return       │      -15.87%    │      -36.54%    │
+│ Max Drawdown       │       18.01%    │       36.54%    │
+│ Win Rate           │       27.10%    │       18.24%    │
+│ Sharpe Ratio       │      -11.36     │      -21.65     │
+├────────────────────┼─────────────────┼─────────────────┤
+│ Total Trades       │         107     │         170     │
+│ Final Equity       │  ₹   841,253   │  ₹   634,566   │
+│ Net P&L            │  ₹  -158,747   │  ₹  -365,434   │
+└────────────────────┴─────────────────┴─────────────────┘
+
+================================================================================
+                              ANALYSIS
+================================================================================
+
+• LONG Only strategy outperforms Full strategy by 20.67%
+• SHORT trades are contributing to losses in the current market condition
+• Win rate is higher in LONG Only (27.1%) vs Full (18.2%)
+• Lower drawdown in LONG Only (18.0%) vs Full (36.5%)
+
+================================================================================
+                            RECOMMENDATION
+================================================================================
+
+Based on August 2025 backtest results, the LONG Only strategy shows better
+risk-adjusted returns. Consider:
+
+1. Using LONG Only strategy in bullish/neutral markets
+2. Further optimizing SHORT entry conditions
+3. Testing with different RSI thresholds
+4. Backtesting on more historical data for validation
+
+================================================================================
+                             DISCLAIMER
+================================================================================
+
+Past performance does not guarantee future results. This is for educational
+purposes only. Always do your own research before trading.
+
+================================================================================
+Generated: 2025-12-30
+Repository: https://github.com/shadab28/backtester
+================================================================================
