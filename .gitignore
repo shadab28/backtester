@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files (large CSV data)
+stock_data/
+stock_data copy/
+
+# Trade logs (generated output)
+trade_logs/
+trade_logs_new_strategy/
+trade_logs_only_long/
+
+# Virtual environment
+venv/
+env/
+.env
