@@ -4,31 +4,83 @@ __pycache__/
 *$py.class
 *.so
 .Python
+*.egg
 *.egg-info/
 dist/
 build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
 
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
+.project
+.pydevproject
+.settings/
 
-# Data files (large CSV data)
+# Data files (large CSV data - download separately)
 stock_data/
 stock_data copy/
 
-# # Trade logs (generated output)
-# trade_logs/
-# trade_logs_new_strategy/
-# trade_logs_only_long/
-
-# Virtual environment
-venv/
-env/
-.env
+# Logs (keep trade_logs in repo for reference)
+*.log
