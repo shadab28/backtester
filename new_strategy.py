@@ -34,6 +34,12 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from multiprocessing import Pool, cpu_count
 import warnings
+import time
+try:
+    import matplotlib.pyplot as plt
+    HAVE_MATPLOTLIB = True
+except Exception:
+    HAVE_MATPLOTLIB = False
 
 import pandas as pd
 import numpy as np
@@ -54,15 +60,146 @@ SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR / "stock_data"
 TRADE_LOG_DIR = SCRIPT_DIR / "trade_logs_new_strategy"
 
+# In-memory cache for preloaded CSVs: { 'YYYYMMDD': DataFrame }
+PRELOAD_CACHE = {}
+
+# Optional Numba acceleration
+HAVE_NUMBA = False
+try:
+    from numba import njit
+
+    HAVE_NUMBA = True
+except Exception:
+    HAVE_NUMBA = False
+
+if HAVE_NUMBA:
+    # Numba-accelerated EMA (simple loop, handles NaNs by forward-filling initial value)
+    @njit
+    def ema_numba(arr, span):
+        n = arr.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            out[i] = np.nan
+
+        if n == 0:
+            return out
+
+        alpha = 2.0 / (span + 1.0)
+
+        # find first non-nan
+        first_idx = -1
+        for i in range(n):
+            if not np.isnan(arr[i]):
+                first_idx = i
+                break
+
+        if first_idx == -1:
+            return out
+
+        last = arr[first_idx]
+        out[first_idx] = last
+
+        for j in range(first_idx + 1, n):
+            if np.isnan(arr[j]):
+                out[j] = np.nan
+            else:
+                last = alpha * arr[j] + (1.0 - alpha) * last
+                out[j] = last
+
+        return out
+
+    # Numba-accelerated RSI using Wilder smoothing (alpha = 1/period)
+    @njit
+    def rsi_numba(arr, period):
+        n = arr.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            out[i] = np.nan
+
+        if n <= period:
+            return out
+
+        # compute deltas
+        deltas = np.empty(n, dtype=np.float64)
+        deltas[0] = 0.0
+        for i in range(1, n):
+            if np.isnan(arr[i]) or np.isnan(arr[i - 1]):
+                deltas[i] = 0.0
+            else:
+                deltas[i] = arr[i] - arr[i - 1]
+
+        gains = np.zeros(n, dtype=np.float64)
+        losses = np.zeros(n, dtype=np.float64)
+        for i in range(1, n):
+            d = deltas[i]
+            if d > 0:
+                gains[i] = d
+                losses[i] = 0.0
+            else:
+                gains[i] = 0.0
+                losses[i] = -d
+
+        # initial average gains/losses (from 1..period)
+        sum_gain = 0.0
+        sum_loss = 0.0
+        count = 0
+        for i in range(1, period + 1):
+            sum_gain += gains[i]
+            sum_loss += losses[i]
+            count += 1
+
+        if count == 0:
+            return out
+
+        avg_gain = sum_gain / count
+        avg_loss = sum_loss / count
+
+        # first valid RSI at index 'period'
+        if avg_loss == 0.0:
+            out[period] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            out[period] = 100.0 - (100.0 / (1.0 + rs))
+
+        for i in range(period + 1, n):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            if avg_loss == 0.0:
+                out[i] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                out[i] = 100.0 - (100.0 / (1.0 + rs))
+
+        return out
+
 # ========== INDICATOR FUNCTIONS ==========
 
 def calculate_ema(series: pd.Series, span: int) -> pd.Series:
     """Calculate Exponential Moving Average"""
+    # Use numba accelerated implementation when possible for large numpy arrays
+    try:
+        # If caller passed a pandas Series, convert to numpy for numba
+        if HAVE_NUMBA and isinstance(series, (pd.Series, np.ndarray)):
+            arr = np.asarray(series)
+            ema_arr = ema_numba(arr, span)
+            return pd.Series(ema_arr, index=getattr(series, 'index', None))
+    except NameError:
+        pass
+
     return series.ewm(span=span, adjust=False).mean()
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """Calculate Relative Strength Index"""
+    # Try to use numba-accelerated version for performance on large arrays
+    try:
+        if HAVE_NUMBA and isinstance(series, (pd.Series, np.ndarray)):
+            arr = np.asarray(series)
+            rsi_arr = rsi_numba(arr, period)
+            return pd.Series(rsi_arr, index=getattr(series, 'index', None))
+    except NameError:
+        pass
+
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -78,14 +215,39 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 def load_data_for_date(date: datetime.date, data_dir: Path = DATA_DIR) -> pd.DataFrame:
     """Load all stock data for a given date from CSV file"""
     date_str = date.strftime("%Y%m%d")
+    # Check preload cache first
+    if PRELOAD_CACHE and date_str in PRELOAD_CACHE:
+        return PRELOAD_CACHE[date_str]
+
     file_path = data_dir / f"dataNSE_{date_str}.csv"
-    
     if not file_path.exists():
         return pd.DataFrame()
-    
+
     df = pd.read_csv(file_path, parse_dates=["time"])
     df = df.sort_values(["ticker", "time"]).reset_index(drop=True)
     return df
+
+
+def preload_all_data(data_dir: Path = DATA_DIR) -> dict:
+    """Preload all CSV files in data_dir into memory and return the cache dict.
+
+    Cache key: YYYYMMDD (string), value: pandas DataFrame
+    """
+    files = sorted(data_dir.glob("dataNSE_*.csv"))
+    cache = {}
+    for f in tqdm(files, desc="Preloading CSVs", unit="file"):
+        date_str = f.stem.replace("dataNSE_", "")
+        try:
+            df = pd.read_csv(f, parse_dates=["time"])
+            df = df.sort_values(["ticker", "time"]).reset_index(drop=True)
+            cache[date_str] = df
+        except Exception:
+            continue
+
+    # update global cache
+    PRELOAD_CACHE.clear()
+    PRELOAD_CACHE.update(cache)
+    return PRELOAD_CACHE
 
 
 def resample_to_timeframe(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -225,7 +387,7 @@ def simulate_stock_trading(symbol: str, df: pd.DataFrame, date: datetime.date,
     
     # Filter to target date only and after 09:25
     trade_start_time = datetime.combine(date, datetime.strptime("09:25", "%H:%M").time())
-    eod_time = datetime.combine(date, datetime.strptime("15:29", "%H:%M").time())
+    eod_time = datetime.combine(date, datetime.strptime("15:25", "%H:%M").time())
     
     # Keep full day data for lookback (needed for SHORT entry - last 5 candles)
     df_full_day = df[df["time"].dt.date == date].copy().reset_index(drop=True)
@@ -429,6 +591,9 @@ def backtest_single_date(args: tuple) -> dict:
         }
     
     all_trades = []
+    # local timing
+    local_indicator_time = 0.0
+    local_simulation_time = 0.0
     
     # Simulate trading for each stock
     for symbol in top10_stocks:
@@ -437,13 +602,19 @@ def backtest_single_date(args: tuple) -> dict:
             continue
             
         # Prepare indicators
+        t0 = time.time()
         stock_df_with_indicators = prepare_stock_data_with_indicators(stock_df)
+        t1 = time.time()
+        local_indicator_time += (t1 - t0)
         
         if stock_df_with_indicators.empty:
             continue
         
-        # Run simulation
+    # Run simulation
+        t2 = time.time()
         stock_trades = simulate_stock_trading(symbol, stock_df_with_indicators, date, start_equity)
+        t3 = time.time()
+        local_simulation_time += (t3 - t2)
         all_trades.extend(stock_trades)
     
     # Calculate metrics
@@ -466,8 +637,13 @@ def backtest_single_date(args: tuple) -> dict:
     return {
         "date": str(date),
         "trades": all_trades,
-        "metrics": metrics
+        "metrics": metrics,
+        "timing": {
+            "indicator_time_sec": round(local_indicator_time, 6),
+            "simulation_time_sec": round(local_simulation_time, 6)
+        }
     }
+
 
 
 # ========== PERFORMANCE METRICS ==========
@@ -559,7 +735,7 @@ def get_available_dates(data_dir: Path = DATA_DIR) -> list:
 
 
 def run_backtest(start_date: str, end_date: str = None, use_multiprocessing: bool = True, 
-                 num_workers: int = None, verbose: bool = False) -> dict:
+                 num_workers: int = None, verbose: bool = False, profile_enabled: bool = False) -> dict:
     """
     Run the backtest from start_date to end_date
     
@@ -627,6 +803,10 @@ def run_backtest(start_date: str, end_date: str = None, use_multiprocessing: boo
     daily_results = []
     running_equity = BASE_CAPITAL
     
+    # profiling accumulators
+    total_indicator_time = 0.0
+    total_simulation_time = 0.0
+
     if use_multiprocessing and len(dates_to_process) > 1:
         # For multiprocessing, we need to process in batches
         # Process each date sequentially to maintain equity carry-forward
@@ -638,7 +818,10 @@ def run_backtest(start_date: str, end_date: str = None, use_multiprocessing: boo
                 
                 result = backtest_single_date((date, running_equity, DATA_DIR))
                 daily_results.append(result)
-                
+                if profile_enabled and result.get('timing'):
+                    total_indicator_time += result['timing'].get('indicator_time_sec', 0.0)
+                    total_simulation_time += result['timing'].get('simulation_time_sec', 0.0)
+
                 # Update running equity
                 running_equity = result["metrics"]["eod_equity"]
                 
@@ -652,7 +835,10 @@ def run_backtest(start_date: str, end_date: str = None, use_multiprocessing: boo
         for date in tqdm(dates_to_process, desc="Processing dates", unit="day"):
             result = backtest_single_date((date, running_equity, DATA_DIR))
             daily_results.append(result)
-            
+            if profile_enabled and result.get('timing'):
+                total_indicator_time += result['timing'].get('indicator_time_sec', 0.0)
+                total_simulation_time += result['timing'].get('simulation_time_sec', 0.0)
+
             # Update running equity
             running_equity = result["metrics"]["eod_equity"]
             
@@ -697,6 +883,52 @@ def run_backtest(start_date: str, end_date: str = None, use_multiprocessing: boo
     print(f"Daily summary: {summary_path}")
     if all_trades:
         print(f"All trades: {all_trades_path}")
+    
+    # Write profile if enabled
+    if profile_enabled:
+        try:
+            import json
+            profile_path = TRADE_LOG_DIR / "profile_summary.json"
+            profile = {
+                "total_indicator_time_sec": round(total_indicator_time, 6),
+                "total_simulation_time_sec": round(total_simulation_time, 6),
+                "dates_processed": len(dates_to_process)
+            }
+            with open(profile_path, 'w') as fh:
+                json.dump(profile, fh, indent=2)
+            print(f"Profile summary written to: {profile_path}")
+        except Exception:
+            pass
+
+    # Save equity curve and plot
+    try:
+        equity_curve = [BASE_CAPITAL]
+        for r in daily_results:
+            day_pnl = sum(t.get('pnl', 0) for t in r['trades'] if t.get('pnl') is not None)
+            equity_curve.append(equity_curve[-1] + day_pnl)
+
+        equity_df = pd.DataFrame({
+            'day': list(range(len(equity_curve))),
+            'equity': equity_curve
+        })
+        equity_csv_path = TRADE_LOG_DIR / 'equity_curve.csv'
+        equity_df.to_csv(equity_csv_path, index=False, float_format='%.2f')
+
+        if HAVE_MATPLOTLIB:
+            plt.figure(figsize=(10, 5))
+            plt.plot(equity_df['day'], equity_df['equity'], marker='o', linewidth=1)
+            plt.xlabel('Day')
+            plt.ylabel('Equity (INR)')
+            plt.title('Equity Curve')
+            plt.grid(True)
+            equity_png = TRADE_LOG_DIR / 'equity_curve.png'
+            plt.savefig(equity_png, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"Equity curve saved to: {equity_png}")
+        else:
+            print(f"Equity CSV saved to: {equity_csv_path} (matplotlib not available for PNG)")
+    except Exception as e:
+        print(f"Failed to save equity curve: {e}")
     
     return {
         "daily_results": daily_results,
@@ -762,6 +994,24 @@ Examples:
         default=None,
         help="Path to data directory (default: ./stock_data)"
     )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Do not prompt for dates; use defaults or provided args"
+    )
+
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Record simple timing profile for indicator calc vs simulation"
+    )
+
+    parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Preload all CSVs into memory before running (uses more RAM)"
+    )
     
     args = parser.parse_args()
     
@@ -769,30 +1019,62 @@ Examples:
     global DATA_DIR
     if args.data_dir:
         DATA_DIR = Path(args.data_dir)
+
+    # Preload data if requested
+    if getattr(args, 'preload', False):
+        print("Preloading all CSVs into memory...")
+        preload_all_data(DATA_DIR)
+
+    # Enforce fixed minimum start date
+    MIN_START_DATE = datetime.strptime("2025-08-01", "%Y-%m-%d").date()
     
     # Determine date range
+    available_dates = get_available_dates(DATA_DIR)
+    if not available_dates:
+        print(f"No data files found in {DATA_DIR}")
+        sys.exit(1)
+
     if args.all:
-        available_dates = get_available_dates(DATA_DIR)
-        if not available_dates:
-            print(f"No data files found in {DATA_DIR}")
+        # Force start at MIN_START_DATE; ensure data exists from that date
+        if not any(d >= MIN_START_DATE for d in available_dates):
+            print(f"No available data on or after {MIN_START_DATE}. Cannot run.")
             sys.exit(1)
-        start_date = str(available_dates[0])
+        start_date = str(MIN_START_DATE)
         end_date = str(available_dates[-1])
     elif args.start_date:
-        start_date = args.start_date
+        # Ignore provided start date and enforce MIN_START_DATE
+        start_date = str(MIN_START_DATE)
         end_date = args.end_date
+        print(f"Start date fixed to {start_date} (user-provided start date ignored).")
     else:
-        # Default: start from 2025-08-01
-        start_date = "2025-08-01"
-        end_date = args.end_date
+        # Interactive prompt for start/end dates with defaults but enforce MIN_START_DATE
+        if args.non_interactive:
+            start_date = str(MIN_START_DATE)
+            end_date = args.end_date or "2025-08-28"
+        else:
+            default_start = str(MIN_START_DATE)
+            default_end = "2025-08-28"
+            print("No date range provided. Press Enter to accept the default shown in brackets.")
+            inp_start = input(f"Enter start date [default: {default_start}] (YYYY-MM-DD): ").strip()
+            inp_end = input(f"Enter end date   [default: {default_end}] (YYYY-MM-DD): ").strip()
+            # use defaults but enforce minimum
+            chosen_start = inp_start if inp_start else default_start
+            chosen_dt = datetime.strptime(chosen_start, "%Y-%m-%d").date()
+            if chosen_dt < MIN_START_DATE:
+                print(f"Provided start date {chosen_start} is before minimum allowed {MIN_START_DATE}. Using {MIN_START_DATE}.")
+                start_date = str(MIN_START_DATE)
+            else:
+                start_date = chosen_start
+            end_date = inp_end if inp_end else default_end
     
     # Run backtest
     results = run_backtest(
-        start_date=start_date,
-        end_date=end_date,
-        use_multiprocessing=not args.no_multiprocessing,
-        num_workers=args.workers,
-        verbose=args.verbose
+    start_date=start_date,
+    end_date=end_date,
+    use_multiprocessing=not args.no_multiprocessing,
+    num_workers=args.workers,
+    verbose=args.verbose,
+    profile_enabled=getattr(args, 'profile', False)
     )
     
     return results

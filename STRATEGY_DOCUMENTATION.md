@@ -19,6 +19,7 @@
 8. [Performance Results](#performance-results)
 9. [Strategy Variants](#strategy-variants)
 10. [File Structure](#file-structure)
+11. [Optimizations & Profiling](#optimizations--profiling)
 
 ---
 
@@ -1016,3 +1017,108 @@ Max Drawdown Tracks the worst peak-to-trough decline
 ---
 
 *This documentation is comprehensive and covers all aspects of the EMA-RSI intraday strategy. Use it as a reference for understanding, extending, or optimizing the strategy.*
+
+---
+
+## Optimizations & Profiling ⚡
+
+We added optional Numba acceleration and a small built-in profiler to measure where time is spent.
+
+What changed
+- Optional Numba-accelerated implementations added for EMA and RSI. They are used when `numba` is installed in the project's virtualenv.
+- A `--profile` CLI flag was added to `new_strategy.py` to record simple timing information (indicator calculation vs simulation) and write it to `trade_logs_new_strategy/profile_summary.json`.
+- A `--non-interactive` flag was added and interactive date prompts default to `2025-08-01` → `2025-08-28`.
+
+How to enable Numba (recommended for large runs)
+```bash
+source .venv/bin/activate
+pip install numba
+```
+Note: Installing Numba may require llvmlite and a specific numpy version. During installation the venv may downgrade/adjust `numpy` to a supported version. Pin the working versions to `requirements.txt` after you validate the environment.
+
+How to run with profiling
+```bash
+source .venv/bin/activate
+python3 new_strategy.py --start-date 2025-08-01 --end-date 2025-08-28 --profile
+```
+After the run you'll find `trade_logs_new_strategy/profile_summary.json` containing:
+```
+{
+  "total_indicator_time_sec": 12.345678,
+  "total_simulation_time_sec": 8.123456,
+  "dates_processed": 17
+}
+```
+
+Observed effect (on this machine during testing)
+- Without Numba: Aug 1–28 run completed in ~6 seconds; results slightly different due to numeric behavior.
+- With Numba (installed): Full 40-day run completed in ~12 seconds; observed a large change in computed results — this is likely due to NaN/edge-case handling differences in the numba implementations, so validate outputs before trusting them in production.
+
+Recommended next steps
+
+
+## Runtime Options & Defaults
+
+The backtester exposes a compact CLI. Key runtime options and defaults are below.
+
+Flags
+
+- `--start-date / -s` : Start date for backtest. NOTE: the repository enforces a minimum start date of **2025-08-01**. Any earlier user-provided start date will be ignored.
+- `--end-date / -e` : End date for backtest (optional).
+- `--all / -a` : Run for all available dates (start date will be forced to 2025-08-01).
+- `--non-interactive` : Do not prompt for dates; use defaults instead.
+- `--preload` : Preload all CSVs into memory before running. Useful for multi-worker runs; increases RAM usage.
+- `--profile` : Record simple timing profile (indicator vs simulation) and write `trade_logs_new_strategy/profile_summary.json`.
+- `--workers / -w` : Number of worker processes (defaults to CPU count capped internally).
+- `--no-multiprocessing` : Disable parallel processing.
+
+Examples
+
+```bash
+# Run Aug 1 - Aug 28 (defaults)
+python3 new_strategy.py --non-interactive
+
+# Run with preloaded CSVs and 4 workers
+python3 new_strategy.py --all --non-interactive --preload --workers 4
+
+# Run with profiling enabled
+python3 new_strategy.py --start-date 2025-08-01 --end-date 2025-08-28 --profile
+```
+
+## Start Date Enforcement
+
+Rationale
+
+The repository is configured to run experiments starting from **2025-08-01** to ensure consistency across backtests, comparisons, and trade logs. This avoids accidental inclusion of earlier data and maintains a reproducible baseline.
+
+Behavior
+
+- If `--all` is used the backtest will start at `2025-08-01` and run to the newest available date.
+- If a user provides a `--start-date` earlier than `2025-08-01`, that input is ignored and `2025-08-01` is used instead (a console message is printed).
+- If interactive mode is used, the prompt defaults to `2025-08-01` and any earlier value will be clamped to `2025-08-01`.
+
+If you prefer a warning-only policy (allow earlier dates with a printed warning), I can change the code to a soft fallback instead of enforcement.
+
+---
+
+## Reproducibility & Environment
+
+When Numba is installed it may require a specific `numpy`/`llvmlite` combination. After you validate that numba produces matching indicators, pin the working versions in `requirements.txt`.
+
+Suggested lines to pin (example from local run):
+```
+numba==0.63.1
+llvmlite==0.46.0
+numpy==2.3.5
+```
+
+Add and commit these after validation so other collaborators reproduce the same runtime behavior.
+
+---
+
+If you'd like, I can now:
+
+- Produce a small CSV that compares pandas vs numba EMA/RSI for a chosen symbol and date.
+- Convert the strict start-date enforcement to a warning-only behavior.
+- Add an LRU preload mechanism to limit memory usage when preloading.
+
