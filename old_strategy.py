@@ -32,7 +32,7 @@ import glob
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-from multiprocessing import cpu_count
+from multiprocessing import Pool, cpu_count
 import warnings
 import time
 try:
@@ -58,23 +58,152 @@ TRAIL_STEP_PCT = 0.0075  # 0.75% trailing step
 # Paths
 SCRIPT_DIR = Path(__file__).parent
 DATA_DIR = SCRIPT_DIR / "stock_data"
-# Use a separate output folder for the new strategy
-TRADE_LOG_DIR = SCRIPT_DIR / "trade_logs_new_strategy/new"
+TRADE_LOG_DIR = SCRIPT_DIR / "trade_logs_new_strategy/old"
+
+# Allow entries during the first N minutes after trade start (inclusive)
+# Increased to 30 minutes so indicators (10-min / 1-hour) have time to populate
+ENTRY_WINDOW_MINUTES = 30
 
 # In-memory cache for preloaded CSVs: { 'YYYYMMDD': DataFrame }
 PRELOAD_CACHE = {}
+
+# Optional Numba acceleration
+HAVE_NUMBA = False
+try:
+    from numba import njit
+
+    HAVE_NUMBA = True
+except Exception:
+    HAVE_NUMBA = False
+
+if HAVE_NUMBA:
+    # Numba-accelerated EMA (simple loop, handles NaNs by forward-filling initial value)
+    @njit
+    def ema_numba(arr, span):
+        n = arr.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            out[i] = np.nan
+
+        if n == 0:
+            return out
+
+        alpha = 2.0 / (span + 1.0)
+
+        # find first non-nan
+        first_idx = -1
+        for i in range(n):
+            if not np.isnan(arr[i]):
+                first_idx = i
+                break
+
+        if first_idx == -1:
+            return out
+
+        last = arr[first_idx]
+        out[first_idx] = last
+
+        for j in range(first_idx + 1, n):
+            if np.isnan(arr[j]):
+                out[j] = np.nan
+            else:
+                last = alpha * arr[j] + (1.0 - alpha) * last
+                out[j] = last
+
+        return out
+
+    # Numba-accelerated RSI using Wilder smoothing (alpha = 1/period)
+    @njit
+    def rsi_numba(arr, period):
+        n = arr.shape[0]
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            out[i] = np.nan
+
+        if n <= period:
+            return out
+
+        # compute deltas
+        deltas = np.empty(n, dtype=np.float64)
+        deltas[0] = 0.0
+        for i in range(1, n):
+            if np.isnan(arr[i]) or np.isnan(arr[i - 1]):
+                deltas[i] = 0.0
+            else:
+                deltas[i] = arr[i] - arr[i - 1]
+
+        gains = np.zeros(n, dtype=np.float64)
+        losses = np.zeros(n, dtype=np.float64)
+        for i in range(1, n):
+            d = deltas[i]
+            if d > 0:
+                gains[i] = d
+                losses[i] = 0.0
+            else:
+                gains[i] = 0.0
+                losses[i] = -d
+
+        # initial average gains/losses (from 1..period)
+        sum_gain = 0.0
+        sum_loss = 0.0
+        count = 0
+        for i in range(1, period + 1):
+            sum_gain += gains[i]
+            sum_loss += losses[i]
+            count += 1
+
+        if count == 0:
+            return out
+
+        avg_gain = sum_gain / count
+        avg_loss = sum_loss / count
+
+        # first valid RSI at index 'period'
+        if avg_loss == 0.0:
+            out[period] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            out[period] = 100.0 - (100.0 / (1.0 + rs))
+
+        for i in range(period + 1, n):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            if avg_loss == 0.0:
+                out[i] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                out[i] = 100.0 - (100.0 / (1.0 + rs))
+
+        return out
 
 # ========== INDICATOR FUNCTIONS ==========
 
 def calculate_ema(series: pd.Series, span: int) -> pd.Series:
     """Calculate Exponential Moving Average"""
-    # Pure pandas implementation
+    # Use numba accelerated implementation when possible for large numpy arrays
+    try:
+        # If caller passed a pandas Series, convert to numpy for numba
+        if HAVE_NUMBA and isinstance(series, (pd.Series, np.ndarray)):
+            arr = np.asarray(series)
+            ema_arr = ema_numba(arr, span)
+            return pd.Series(ema_arr, index=getattr(series, 'index', None))
+    except NameError:
+        pass
+
     return series.ewm(span=span, adjust=False).mean()
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """Calculate Relative Strength Index"""
-    # Pure pandas RSI (Wilder smoothing via ewm)
+    # Try to use numba-accelerated version for performance on large arrays
+    try:
+        if HAVE_NUMBA and isinstance(series, (pd.Series, np.ndarray)):
+            arr = np.asarray(series)
+            rsi_arr = rsi_numba(arr, period)
+            return pd.Series(rsi_arr, index=getattr(series, 'index', None))
+    except NameError:
+        pass
+
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -382,47 +511,44 @@ def simulate_stock_trading(symbol: str, df: pd.DataFrame, date: datetime.date,
             trades.append(current_order.to_dict())
             current_order = None
             continue
-        
-        # Check for entry conditions (only if no position and not already entered today)
-        if current_order is None and not entered_today:
+    # Entry check (only allow entries on the first minute after trade_start_time)
+        if current_order is None and not entered_today and i < ENTRY_WINDOW_MINUTES:
             # Ensure indicators are available
             if pd.isnull(row.get("ema3")) or pd.isnull(row.get("ema10")) or \
                pd.isnull(row.get("rsi14")) or pd.isnull(row.get("ema50")):
-                continue
-            
-            # LONG Entry: EMA(3) > EMA(10) AND RSI(14) > 60 AND Close > EMA(50)
-            if row["ema3"] > row["ema10"] and row["rsi14"] > 60 and row["close"] > row["ema50"]:
-                entry_price = row["high"]  # Buy at high of entry candle
-                size = int(risk_amount / (entry_price * STOP_LOSS_PCT))
+                # skip entry if indicators not ready
+                pass
+            else:
+                # LONG Entry: EMA(3) > EMA(10) AND RSI(14) > 60 AND Close > EMA(50)
+                if row["ema3"] > row["ema10"] and row["rsi14"] > 60 and row["close"] > row["ema50"]:
+                    entry_price = row["high"]  # Buy at high of entry candle
+                    size = int(risk_amount / (entry_price * STOP_LOSS_PCT))
+
+                    if size > 0:
+                        current_order = Order(symbol, "LONG", current_time, entry_price, size)
+                        current_order.stop_loss = entry_price * (1 - STOP_LOSS_PCT)
+                        current_order.target = entry_price * (1 + PROFIT_TARGET_PCT)
+                        entered_today = True
                 
-                if size > 0:
-                    current_order = Order(symbol, "LONG", current_time, entry_price, size)
-                    current_order.stop_loss = entry_price * (1 - STOP_LOSS_PCT)
-                    current_order.target = entry_price * (1 + PROFIT_TARGET_PCT)
-                    entered_today = True
-                    continue
-            
-            # SHORT Entry: EMA(3) < EMA(10) AND RSI(14) < 30 AND Close < EMA(50)
-            if row["ema3"] < row["ema10"] and row["rsi14"] < 30 and row["close"] < row["ema50"]:
-                # Entry at low of last 5 1-min candles (use full day data for proper lookback)
-                # Find current time index in full day data
-                full_day_idx = df_full_day[df_full_day["time"] == current_time].index
-                if len(full_day_idx) > 0:
-                    idx_in_full = full_day_idx[0]
-                    start_idx = max(0, idx_in_full - 4)
-                    recent_candles = df_full_day.iloc[start_idx:idx_in_full+1]
-                    entry_price = recent_candles["low"].min()
-                else:
-                    entry_price = row["low"]
-                    
-                size = int(risk_amount / (entry_price * STOP_LOSS_PCT))
-                
-                if size > 0:
-                    current_order = Order(symbol, "SHORT", current_time, entry_price, size)
-                    current_order.stop_loss = entry_price * (1 + STOP_LOSS_PCT)
-                    current_order.target = entry_price * (1 - PROFIT_TARGET_PCT)
-                    entered_today = True
-                    continue
+                # SHORT Entry: EMA(3) < EMA(10) AND RSI(14) < 30 AND Close < EMA(50)
+                if current_order is None and row["ema3"] < row["ema10"] and row["rsi14"] < 30 and row["close"] < row["ema50"]:
+                    # Entry at low of last 5 1-min candles (use full day data for proper lookback)
+                    full_day_idx = df_full_day[df_full_day["time"] == current_time].index
+                    if len(full_day_idx) > 0:
+                        idx_in_full = full_day_idx[0]
+                        start_idx = max(0, idx_in_full - 4)
+                        recent_candles = df_full_day.iloc[start_idx:idx_in_full+1]
+                        entry_price = recent_candles["low"].min()
+                    else:
+                        entry_price = row["low"]
+
+                    size = int(risk_amount / (entry_price * STOP_LOSS_PCT))
+
+                    if size > 0:
+                        current_order = Order(symbol, "SHORT", current_time, entry_price, size)
+                        current_order.stop_loss = entry_price * (1 + STOP_LOSS_PCT)
+                        current_order.target = entry_price * (1 - PROFIT_TARGET_PCT)
+                        entered_today = True
     
     # Handle any remaining open position at end of data
     if current_order is not None:

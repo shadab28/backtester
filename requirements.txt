@@ -5,7 +5,6 @@ tqdm>=4.64.0
 
 # Optional: for enhanced performance
 # numba>=0.56.0
-matplotlib>=3.5.0
 
 # Development dependencies (optional)
 # pytest>=7.0.0
